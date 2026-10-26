@@ -494,11 +494,19 @@ try {
   await page.route('**/api/export/record', (route) => route.fulfill({ json: { ok: true } }));
   await page.getByRole('button', { name: 'MP3 (compressed)', exact: true }).click();
   await page.getByRole('button', { name: '320 kbps', exact: true }).click();
-  await page.getByRole('switch', { name: 'Background audio', exact: true }).click();
+  // #2964: the background bed level reaches the export while the background is mixed in.
+  const bedLevel = page.getByRole('slider', { name: 'Background volume', exact: true });
+  await bedLevel.focus();
+  await bedLevel.press('ArrowRight');
+  await page.getByText('110%', { exact: true }).waitFor();
   rejectExport = true;
   await page.getByRole('button', { name: 'Export', exact: true }).click();
   await page.getByRole('alert').waitFor();
   assert.equal(await page.getByText('private backend trace').count(), 0);
+  assert.equal(exportRequests.at(-1).searchParams.get('preserve_bg'), 'true');
+  assert.equal(exportRequests.at(-1).searchParams.get('bed_level'), '1.1');
+  await page.getByRole('switch', { name: 'Background audio', exact: true }).click();
+  await bedLevel.waitFor({ state: 'hidden' });
   rejectExport = false;
   await page.getByRole('button', { name: 'Export', exact: true }).click();
   await page.waitForFunction(() => globalThis.__nativeSaveRequests.length === 1);
@@ -507,6 +515,7 @@ try {
   assert.equal(exportRequests.at(-1).searchParams.get('lang'), 'es');
   assert.equal(exportRequests.at(-1).searchParams.get('bitrate'), '320k');
   assert.equal(exportRequests.at(-1).searchParams.get('preserve_bg'), 'false');
+  assert.equal(exportRequests.at(-1).searchParams.get('bed_level'), null);
   let subtitleRequest;
   await page.route('**/api/dub/srt/fixture?*', (route) => {
     subtitleRequest = new URL(route.request().url());
@@ -546,8 +555,49 @@ try {
     await page.getByRole('button', { name: '320 kbps', exact: true }).getAttribute('aria-pressed'),
     'true',
   );
-  await page.evaluate(() => sessionStorage.setItem('voicestudio.test.reset-dub', '1'));
-  await page.reload();
+  // A prepared upload can be replaced with a URL without first removing it.
+  const linkInput = page.getByRole('textbox', { name: /paste YouTube/ });
+  await page.getByRole('button', { name: 'Use link', exact: true }).click();
+  await linkInput.fill('https://example.com/cancelled.mp4');
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  assert.equal(await linkInput.count(), 0);
+  assert.equal(urlRequest, undefined);
+  await page.getByRole('button', { name: 'Use link', exact: true }).click();
+  await linkInput.fill('https://example.com/stale.mp4');
+  await page.evaluate(async () => {
+    const { dubSession } = await import('/src/features/dub/dub-session.ts');
+    dubSession.setState((current) => ({ ...current, jobId: 'replacement', filename: 'replacement.mp4' }));
+  });
+  await linkInput.waitFor({ state: 'hidden' });
+  await page.getByRole('button', { name: 'Use link', exact: true }).click();
+  assert.equal(await linkInput.inputValue(), '');
+  // Cancellation can outlive the active stream; retain the replacement form.
+  let finishAbort;
+  const abortReady = new Promise((resolve) => { finishAbort = resolve; });
+  await page.route('**/api/dub/abort/replacement', async (route) => {
+    await abortReady;
+    await route.fulfill({ json: {} });
+  });
+  await linkInput.fill('https://example.com/pending.mp4');
+  const abortRequest = page.waitForRequest('**/api/dub/abort/replacement');
+  await page.evaluate(async () => {
+    const { dubSession, cancelDub } = await import('/src/features/dub/dub-session.ts');
+    dubSession.setState((current) => ({ ...current, batchProgress: { current: 1, total: 2 } }));
+    void cancelDub();
+  });
+  await abortRequest;
+  await page.waitForFunction(() => [...document.querySelectorAll('button')].some(
+    (button) => button.textContent?.trim() === 'Ingest' && button.disabled,
+  ));
+  await linkInput.evaluate((input) => input.closest('form').dispatchEvent(
+    new Event('submit', { bubbles: true, cancelable: true }),
+  ));
+  assert.equal(await linkInput.inputValue(), 'https://example.com/pending.mp4');
+  assert.equal(urlRequest, undefined);
+  finishAbort();
+  await page.waitForFunction(() => [...document.querySelectorAll('button')].some(
+    (button) => button.textContent?.trim() === 'Ingest' && !button.disabled,
+  ));
   failTranscription = true;
   await page.getByRole('textbox', { name: /paste YouTube/ }).fill('https://example.com/movie.mp4');
   await page

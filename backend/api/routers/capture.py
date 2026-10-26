@@ -121,6 +121,15 @@ async def transcribe_audio(
             if transcribe_missing is None:
                 missing = None
                 use_active_asr = True
+        # The selected offline engine's weights are absent, but a reference
+        # transcript does not need that engine: generate transcribes through
+        # any installed recognizer, so the preview must too (#2929/#2678).
+        reference_fallback = False
+        if missing is not None and requested_mode == "reference":
+            from services.asr_backend import reference_asr_installed
+            reference_fallback = await asyncio.to_thread(reference_asr_installed)
+            if reference_fallback:
+                missing = None
         if missing is not None:
             raise HTTPException(
                 status_code=409,
@@ -137,6 +146,9 @@ async def transcribe_audio(
             return dictation_transcribe_kwargs(backend)
 
         def _run():
+            if reference_fallback:
+                from services.asr_backend import transcribe_reference
+                return {"text": transcribe_reference(tmp.name) or ""}, "reference", None
             if use_active_asr:
                 # Accurate mode: full WhisperX with forced alignment —
                 # for when the user explicitly wants word-level timing.
@@ -280,9 +292,19 @@ async def transcribe_audio(
         # dictation socket (capture_ws) does, so the widget's POST fallback and
         # MCP/CLI callers get the same typed-looking result the WS returns —
         # not the raw "...test" the REST path used to leak. Segments stay raw
-        # (their timings/verbatim recognition are the contract).
+        # (their timings/verbatim recognition are the contract). Hotkey
+        # dictation callers (dictation=true) also get the dictation cleanup
+        # (hesitations, stutters, spacing, optional spoken punctuation) the
+        # socket applies; file transcription, MCP/CLI and voice-clone
+        # reference transcripts keep the words that were spoken.
         from services.text_polish import polish_text
-        full_text = polish_text(full_text)
+        if _truthy(dictation) and requested_mode != "reference":
+            from services.dictation_cleanup import polish_dictation
+            full_text = await asyncio.to_thread(
+                polish_dictation, full_text, result.get("language") or language,
+            )
+        else:
+            full_text = polish_text(full_text)
 
         # Calculate audio duration from segments if available. A segment whose
         # timing the engine could not determine carries end=None (sherpa's

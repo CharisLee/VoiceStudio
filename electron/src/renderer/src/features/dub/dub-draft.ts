@@ -160,23 +160,25 @@ export function restoreDubDraft(raw: string | null, defaults: DubSession): DubSe
       fitOptions:
         value.fitOptions && typeof value.fitOptions === 'object' && !Array.isArray(value.fitOptions)
           ? Object.fromEntries(
-              Object.entries(value.fitOptions).filter(([key, item]) =>
-                key === 'allow_video_retime'
-                  ? typeof item === 'boolean'
-                  : [
-                      'max_audio_only_rate',
-                      'audio_rate_cap',
-                      'video_slow_cap',
-                      'gap_guard_s',
-                    ].includes(key) &&
-                    typeof item === 'number' &&
-                    Number.isFinite(item) &&
-                    item >= (key === 'gap_guard_s' ? 0 : 1),
-              ),
+              Object.entries(value.fitOptions).filter(([key, item]) => {
+                if (key === 'allow_video_retime') return typeof item === 'boolean';
+                if (typeof item !== 'number' || !Number.isFinite(item)) return false;
+                if (key === 'gap_guard_s') return item >= 0;
+                if (key === 'min_audio_rate') return item >= 0.5 && item <= 1;
+                return ['max_audio_only_rate', 'audio_rate_cap', 'video_slow_cap'].includes(key)
+                  && item >= 1;
+              }),
             )
           : undefined,
       exportOptions: restoreExportPreferences(value.exportOptions),
       translationFallback: value.translationFallback === true,
+      dialectIgnored: value.dialectIgnored === true,
+      dialectUsed:
+        value.dialectIgnored === true &&
+        typeof value.dialectUsed === 'string' &&
+        /^[a-zA-Z]{2,3}-[a-zA-Z]{2,4}$/.test(value.dialectUsed)
+          ? value.dialectUsed
+          : undefined,
       quality: ['fast', 'autofit', 'cinematic', 'agent'].includes(value.quality)
         ? value.quality
         : defaults.quality,

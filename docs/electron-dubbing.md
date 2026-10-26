@@ -41,6 +41,8 @@ Generate. Persisted provider error pages are discarded and restored to the sourc
 dialogue with a retryable error state.
 
 Long projects virtualize transcript rows, so only the visible editors are mounted.
+
+The Dubbing pane has a Projects tab beside its controls that lists saved dub projects, newest first. Selecting a project and confirming opens it in place (it waits while a dub is running); the Projects workspace remains the place to save, rename and delete.
 Timeline waveform peaks and onsets are computed once by the backend and cached as a
 small JSON payload; Chromium never decodes the full separated-vocals WAV to draw the
 timeline. Video previews are written atomically with MP4 fast-start metadata and are
@@ -117,6 +119,23 @@ an inline explanation with a link to LLM settings. It does not silently claim
 that Cinematic or Autofit completed. Browser fixtures cover this fallback and
 reload persistence; real LLM-backed quality passes remain unverified.
 
+A regional dialect is a prompt instruction, so only an LLM-backed translation
+can act on one. A neural machine-translation engine has a single code per
+language — NLLB's `por_Latn` is Portuguese with no European variant to select —
+so asking it for Portuguese (Portugal) returns whatever its training favoured.
+The backend reports whether the dialect was applied, and the workspace shows an
+inline explanation beside the translator when it was not, with a link to LLM
+settings. The selection is never silently discarded. The notice describes the
+last translation, so switching to an LLM-backed engine and translating again
+clears it.
+
+Portuguese (Brazil) and Portuguese (Portugal) are separate target choices; both
+write the Portuguese track with that dialect, and a plain Portuguese target
+means Brazilian. NLLB, Argos and Google write Brazilian Portuguese, so a
+Brazilian request counts as applied and a European one shows the notice naming
+the variant the engine wrote (`dialect_used` in the response). See
+[Supported Languages](languages.md#regional-variants).
+
 **Translate with Agent** detects the installed Codex, Claude Code, OpenCode and Pi CLIs. Dubbing
 presents Agent and the active Google, Argos, NLLB or API engine as separate translator choices;
 Fast, Autofit and Cinematic remain quality choices for engine translation. The selected agent receives the complete ordered
@@ -186,7 +205,21 @@ including zero guidance. Engine-specific audible effects remain unverified.
 Saved Smart Fit override values now survive project import and draft recovery and
 reach generation only when Smart Fit is selected. Other timing strategies omit
 those parameters. Unit tests cover round-trip preservation and request routing;
-there is no new tuning panel (Tauri exposes these as stored preferences).
+the speed limits now have a panel (below).
+
+**Smart Fit speed limits (#2896).** With Smart Fit selected, the Timing section
+shows two sliders: *Fastest speed* (`audio_rate_cap`, 1.0 to 2.0, default 1.5) and
+*Slowest speed* (`min_audio_rate`, 0.5 to 1.0, default 0.85; 1.0 stops short lines
+being slowed to fill their slot). Both are sent as `fit_options`, validated by the
+API (out-of-range values return 422), saved with drafts and projects, and leave
+the defaults untouched until moved. Changing one re-mixes rendered lines without
+re-synthesizing them.
+
+The backend validates `fit_options` before synthesis: `max_audio_only_rate`,
+`audio_rate_cap`, and `video_slow_cap` must be finite and at least 1;
+`gap_guard_s` must be finite and nonnegative. Invalid overrides return HTTP 422.
+Omitted or null values retain the server defaults; a zero gap guard and
+`allow_video_retime: false` remain explicit overrides.
 
 Real export verification: `tests/test_smart_fit_export.py` passes all 43 tests
 with the installed app-managed FFmpeg/ffprobe explicitly supplied. Its seven
@@ -394,3 +427,7 @@ audio if a later import fails validation or runs out of space.
 
 Cancelling an upload waits for its copy worker to stop before closing the input
 and clearing the reserved job, so the same upload can be retried safely.
+
+Use **Use link** beside an uploaded source to replace it with a URL. **Cancel**
+closes the URL form without changing the source; changing the source also closes
+the form. URL ingestion waits until any pending cancellation finishes.

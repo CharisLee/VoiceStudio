@@ -11,6 +11,7 @@ import { PipelineFailure } from '@/components/pipeline-failure';
 import { AgentFixButton } from '@/components/agent-fix-button';
 import { ProfileAvatar } from '@/components/profile-avatar';
 import { WaveformPlayer } from '@/components/waveform-player';
+import { SaveAudioButton } from '@/components/save-audio-button';
 import { useEngines } from '@/hooks/use-engines';
 import { useProfiles } from '@/hooks/use-profiles';
 import { useRecording } from '@/hooks/use-recording';
@@ -66,7 +67,11 @@ export function ConvertVoice() {
     };
   }, [file]);
   useEffect(() => () => request.current?.abort(), []);
-  const voices = (profiles.data ?? []).filter((p) => p.kind === 'clone' && p.ref_audio_path);
+  // Match the backend's profile conditioning: designs use their saved sample
+  // or instructions; clones need a reference (a locked take takes precedence).
+  const voices = (profiles.data ?? []).filter(
+    (p) => p.kind === 'design' || p.ref_audio_path || (p.is_locked && p.locked_audio_path),
+  );
   const valid = canClone && file && voices.some((p) => p.id === voice) && !recordingBusy;
   const run = async () => {
     if (!valid || request.current) return;
@@ -274,7 +279,13 @@ export function ConvertVoice() {
       </div>
       {result && (
         <section className="space-y-3 border-t pt-4" aria-label={t('convert.result_kicker')}>
-          <h3 className="text-sm font-medium">{t('convert.result_kicker')}</h3>
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="text-sm font-medium">{t('convert.result_kicker')}</h3>
+            <SaveAudioButton
+              url={apiPath(result.audio_url)}
+              suggestedName={`voicestudio-${result.id}.wav`}
+            />
+          </div>
           <WaveformPlayer src={apiPath(result.audio_url)} source="convert-result" height={40} />
           <p className="text-sm">
             <span className="text-muted-foreground">{t('convert.transcript')}: </span>

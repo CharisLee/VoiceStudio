@@ -1,3 +1,4 @@
+import importlib
 import os
 import sys
 
@@ -32,6 +33,13 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--supervise"
 from core.contained_subprocess import secure_backend_drain_fd  # noqa: E402
 
 secure_backend_drain_fd()
+
+# The shell reads our stdout/stderr through pipes; a reader that falls behind
+# would otherwise block uvicorn's access-log write on the event loop and freeze
+# /health (#2970 class). Producers get a bounded buffer instead.
+from core.nonblocking_stdio import install as _install_nonblocking_stdio  # noqa: E402
+
+_install_nonblocking_stdio()
 
 import math  # noqa: E402
 
@@ -142,6 +150,10 @@ except ImportError:
 from services.hf_auth import apply_process_token_policy as _apply_hf_token_policy  # noqa: E402
 
 _apply_hf_token_policy()
+
+# Importing it removes Electron's account-bridge capability from os.environ, so
+# engine and tool subprocesses never inherit it.
+importlib.import_module("services.cloud_account")
 
 # ── cuDNN 8 library preload ─────────────────────────────────────────────
 # Moved into _phase_a_build (`native_preload` step, early-bind refactor): the
@@ -390,6 +402,7 @@ from core.auth import (
     PrincipalKind,
     credential_matches,
     is_local_host,
+    is_trusted_host_loopback,
     principal_for,
     remote_api_key,
 )
@@ -656,7 +669,24 @@ def _phase_a_build_inner() -> None:
         pass
 
     _startup_progress.begin_step("ml_imports")
-    import torchaudio
+    try:
+        import torchaudio  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        # Sanitized summary only, never a traceback-bearing log call: an
+        # import traceback embeds absolute user-home paths (C:\Users\<name>\…, /Users/<name>/…)
+        # and lands in backend.log, which goes into diagnostic bundles and
+        # prefilled bug reports (CWE-532; CodeRabbit #3150).
+        try:
+            from core.failure import sanitize as _sanitize
+            _detail = _sanitize(f"{type(exc).__name__}: {exc}")
+        except Exception:  # noqa: BLE001 — never lose the signal to this
+            _detail = type(exc).__name__
+        logging.getLogger("omnivoice.model").warning(
+            "torchaudio import failed during ml_imports (startup will "
+            "continue degraded): %s",
+            _detail,
+        )
+        torchaudio = None  # type: ignore[assignment]
     warnings.filterwarnings("ignore", category=UserWarning)
     # torchaudio 2.9 REMOVED set_audio_backend(); soundfile has been the only
     # backend since 2.0, so the call was already a no-op there and is simply
@@ -674,8 +704,15 @@ def _phase_a_build_inner() -> None:
     # lists sm_120 in get_arch_list(). CU128_ARCHS in
     # tests/test_cuda_arch_compat.py records the same list, captured verbatim
     # from a real cu128 build in #1285.
-    if hasattr(torchaudio, "set_audio_backend"):
-        torchaudio.set_audio_backend("soundfile")
+    # The bare hasattr guard (no `torchaudio is not None` prefix) is what
+    # tests/test_torchaudio_legacy_backend_1931.py asserts, and it is safe
+    # either way: hasattr(None, ...) is False, so the call is skipped when
+    # the import above failed too.
+    try:
+        if hasattr(torchaudio, "set_audio_backend"):
+            torchaudio.set_audio_backend("soundfile")
+    except Exception:  # noqa: BLE001
+        pass
     from utils import hf_progress
     # HF tqdm patch before any library import that can trigger
     # hf_hub_download (transformers, mlx_whisper, …).
@@ -743,6 +780,7 @@ def _phase_a_build_inner() -> None:
     from api.routers import mcp_bindings as _mcp_bindings_router  # noqa: E402
     from api.routers import telephony_twilio as _telephony_twilio_router  # noqa: E402
     from api.routers import calls as _calls_router  # noqa: E402
+    from api.routers import cloud_sync as _cloud_sync_router  # noqa: E402
     _router_modules.extend([
         system, profiles, profile_images, exports, generation, voice_convert, dub_core, dub_generate,
         dub_export, dub_translate, projects, glossary, engines, tools,
@@ -751,7 +789,7 @@ def _phase_a_build_inner() -> None:
         openai_compat, tts_stream, marketplace, personas, sonitranslate,
         audiobook, longform_jobs, pronunciation, settings_router,
         media_tools_router, auth_router, _mcp_bindings_router,
-        _telephony_twilio_router, _calls_router,
+        _telephony_twilio_router, _calls_router, _cloud_sync_router,
     ])
     # Download-acceleration state, once, for triage-from-logs (FDL-03).
     try:
@@ -849,10 +887,16 @@ def _phase_a_finalize() -> None:
         def _no_web_ui(request: Request):
             # Only a local browser may be sent to the local dev UI; a LAN
             # device redirected to localhost reaches itself, not us (#2599).
+            # The PIN query survives the hop so the gate still sees it, and
+            # a request already aimed at the UI port is answered terminally
+            # instead of bouncing onto itself forever (#2680: with default
+            # ports the share listener sits on the UI port).
             client = request.client.host if request.client else None
-            target = dev_ui_redirect(client, request.headers.get("host", ""), _ui_port())
-            if target:
-                return RedirectResponse(url=target)
+            ui_port = _ui_port()
+            target = dev_ui_redirect(client, request.headers.get("host", ""), ui_port)
+            if target and request.url.port != ui_port:
+                query = request.url.query
+                return RedirectResponse(url=target + (f"/?{query}" if query else ""))
             media_type, body = web_ui_missing_body(request.headers.get("accept", ""))
             return Response(body, status_code=503, media_type=media_type)
 
@@ -912,27 +956,21 @@ async def _deferred_startup(app: FastAPI) -> None:
         os._exit(1)
 
 
-# Same lifecycle markers as Phase A: cancelling the task cannot stop the thread
-# already importing engine runtimes, so shutdown waits (bounded) for it rather
-# than let interpreter teardown race a native import (#1000 class).
-_profile_reconcile_started = threading.Event()
-_profile_reconcile_finished = threading.Event()
-
-
 def _reconcile_profile_blocking():
-    _profile_reconcile_started.set()
-    try:
-        from services.performance_profiles import reconcile_active_profile
+    from services.performance_profiles import reconcile_active_profile
 
-        return reconcile_active_profile()
-    finally:
-        _profile_reconcile_finished.set()
+    return reconcile_active_profile()
 
 
-async def _reconcile_profile_in_background() -> None:
+async def _reconcile_profile_in_background(app: FastAPI) -> None:
     """Reapply the saved performance profile off the startup critical path."""
     try:
-        recovered = await asyncio.to_thread(_reconcile_profile_blocking)
+        # Store only successfully submitted work. Shielding keeps cancellation
+        # of the asyncio wrapper from cancelling queued executor work, so the
+        # shutdown wait can track its actual completion (#2861).
+        worker = asyncio.get_running_loop().run_in_executor(None, _reconcile_profile_blocking)
+        app.state.profile_reconcile_worker = worker
+        recovered = await asyncio.shield(worker)
         if recovered:
             logger.info("Startup performance selections reconciled: %s", recovered)
     except asyncio.CancelledError:
@@ -941,11 +979,33 @@ async def _reconcile_profile_in_background() -> None:
         logger.exception("Performance-profile reconciliation failed (non-fatal).")
 
 
+def _start_profile_reconcile(app: FastAPI) -> None:
+    """Schedule reconciliation with a worker handle owned by this lifespan."""
+    app.state.profile_reconcile_worker = None
+    app.state.profile_reconcile_task = asyncio.create_task(_reconcile_profile_in_background(app))
+
+
+async def _wait_for_profile_reconcile_thread(app: FastAPI) -> None:
+    """Stop new submissions and bound waiting for this boot's executor work."""
+    task = getattr(app.state, "profile_reconcile_task", None)
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    worker = getattr(app.state, "profile_reconcile_worker", None)
+    if worker is not None and not worker.done():
+        # asyncio.wait neither cancels the executor future on timeout nor
+        # needs a free executor thread to enforce the shutdown deadline.
+        await asyncio.wait({worker}, timeout=20.0)
+
+
 async def _await_profile_reconcile(app: FastAPI) -> None:
     """Let model warm-ups wait for reconciliation without inheriting its failure."""
     task = getattr(app.state, "profile_reconcile_task", None)
     if task is not None:
-        await asyncio.wait({task})
+        if not task.done():
+            await asyncio.wait({task})
+        if task.cancelled():
+            raise asyncio.CancelledError
 
 
 async def _phase_b(app: FastAPI) -> None:
@@ -1021,7 +1081,7 @@ async def _phase_b(app: FastAPI) -> None:
     # on a cold disk), and nothing the first screen shows depends on the result,
     # so it runs in the background instead of holding /health at 503. The model
     # warm-ups below await it, so they still load the reconciled selections.
-    app.state.profile_reconcile_task = asyncio.create_task(_reconcile_profile_in_background())
+    _start_profile_reconcile(app)
     if _EAGER:
         # Eager boots (pytest, OMNIVOICE_EAGER_INIT=1) promise the classic
         # synchronous startup: callers read engines the moment the lifespan
@@ -1128,6 +1188,18 @@ async def _phase_b(app: FastAPI) -> None:
     )
     app.state.mcp_task = mcp_task
     app.state.mcp_stop = mcp_stop
+
+    # VoiceStudio Cloud settings sync: idles (no Cloud call) unless main hands
+    # out a token, i.e. the user is signed in with sync switched on.
+    from services.cloud_sync.service import get_service as _cloud_sync
+
+    async def _start_cloud_sync() -> None:
+        try:
+            await _cloud_sync().start()
+        except Exception:  # noqa: BLE001 — optional feature: never blocks start-up
+            logger.exception("cloud sync did not start")
+
+    app.state.cloud_sync_task = asyncio.create_task(_start_cloud_sync())
     if mcp_mounted:
         logger.info("MCP server mounted at /mcp")
     # Phone calls (opt-in): the separate loopback telephony listener resumes
@@ -1202,7 +1274,15 @@ async def lifespan(app: FastAPI):
         # StartupGate. The watchdog stays armed until the deferred task
         # disarms it, so a hang inside Phase A/B still gets its thread dump.
         app.state.startup_task = asyncio.create_task(_deferred_startup(app))
+    try:
+        from core.loop_stall_monitor import start_loop_stall_monitor
+
+        _loop_stall_stop = start_loop_stall_monitor()
+    except Exception:
+        _loop_stall_stop = None  # diagnostics-only
     yield
+    if _loop_stall_stop is not None:
+        _loop_stall_stop.set()
     # ── Graceful shutdown (SIGTERM from Tauri, Ctrl+C, etc.) ────────────
     # Retire the run sentinel FIRST, before any bounded wait below (#1895):
     # once uvicorn has begun graceful shutdown the exit is deliberate by
@@ -1252,8 +1332,7 @@ async def lifespan(app: FastAPI):
     # before Phase A began pays nothing.
     if _phase_a_started.is_set() and not _phase_a_finished.is_set():
         await asyncio.to_thread(_phase_a_finished.wait, 20.0)
-    if _profile_reconcile_started.is_set() and not _profile_reconcile_finished.is_set():
-        await asyncio.to_thread(_profile_reconcile_finished.wait, 20.0)
+    await _wait_for_profile_reconcile_thread(app)
     try:
         from services.telephony import gateway as telephony_gateway
         await telephony_gateway.stop()
@@ -1268,6 +1347,13 @@ async def lifespan(app: FastAPI):
         model_loads_begin_shutdown()
     # Stop MCP first — signal its task to exit its own anyio context (correct
     # task-affinity), then bound the wait so a wedged manager can't hang exit.
+    if getattr(app.state, "cloud_sync_task", None) is not None:
+        from services.cloud_sync.service import get_service as _cloud_sync
+
+        try:
+            await asyncio.wait_for(_cloud_sync().stop(), timeout=5.0)
+        except Exception:  # noqa: BLE001
+            pass
     mcp_stop = getattr(app.state, "mcp_stop", None)
     mcp_task = getattr(app.state, "mcp_task", None)
     if mcp_stop is not None:
@@ -1455,6 +1541,10 @@ def _safe_validation_input(value):
     """
     if isinstance(value, (bytes, bytearray, memoryview)):
         return f"<{len(bytes(value))} bytes of binary data>"
+    # JSON number overflow (e.g. 1e309) and accepted NaN/Infinity tokens can
+    # reach Pydantic as floats, but cannot be echoed in a JSONResponse.
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
     if isinstance(value, str) and len(value) > _VALIDATION_INPUT_MAX:
         return value[:_VALIDATION_INPUT_MAX] + f"… (+{len(value) - _VALIDATION_INPUT_MAX} chars)"
     return value
@@ -1617,6 +1707,12 @@ async def global_exception_handler(request: Request, exc: Exception):
         fallback="VoiceStudio hit an internal error; check the backend log for details.",
     )
     content["error_class"] = _entry.get("error_class")
+    # The Python exception TYPE rides along with the taxonomy class. The class
+    # is "UNKNOWN" for most failures, which made every such 500 render the same
+    # fixed sentence AND the same report (#2917/#2916/#2688); the type name is
+    # VoiceStudio-safe (a type, never user text) and is what tells a
+    # RuntimeError from a KeyError. No substring of the message is copied.
+    content["error_type"] = type(exc).__name__
     return JSONResponse(
         content,
         status_code=500,
@@ -1712,7 +1808,7 @@ class NetworkAccessMiddleware:
         if not pin:
             return await self.app(scope, receive, send)
         client = scope["client"][0] if scope.get("client") else None
-        if is_local_host(client):
+        if is_local_host(client) or is_trusted_host_loopback(request):
             return await self.app(scope, receive, send)
         if _is_public_path(scope["path"]):
             return await self.app(scope, receive, send)

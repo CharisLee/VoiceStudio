@@ -1,5 +1,5 @@
 import { clearConversion } from './conversion-state';
-import { cleanup, fireEvent, render, screen, act } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, act, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, expect, it, vi } from 'vitest';
 const mock = vi.hoisted(() => ({
@@ -8,6 +8,10 @@ const mock = vi.hoisted(() => ({
   convert: vi.fn(),
   ready: true,
   cloning: true as boolean | null,
+  saveAudio: vi.fn(() => Promise.resolve({ canceled: true })),
+}));
+vi.mock('@/components/bridge', () => ({
+  getBridge: () => ({ files: { saveAudio: mock.saveAudio, revealPath: vi.fn() } }),
 }));
 vi.mock('@/hooks/use-engines', () => ({
   useEngines: () => ({
@@ -28,7 +32,20 @@ vi.mock('@/hooks/use-recording', () => ({
 }));
 vi.mock('@/hooks/use-profiles', () => ({
   useProfiles: () => ({
-    data: [{ id: 'a', name: 'Alpha', kind: 'clone', ref_audio_path: 'a.wav' }],
+    data: [
+      { id: 'a', name: 'Alpha', kind: 'clone', ref_audio_path: 'a.wav' },
+      { id: 'design', name: 'Captain Crusty', kind: 'design', ref_audio_path: 'design.wav' },
+      { id: 'legacy-design', name: 'Legacy Design', kind: 'design', ref_audio_path: null },
+      {
+        id: 'locked',
+        name: 'Locked Clone',
+        kind: 'clone',
+        ref_audio_path: null,
+        is_locked: true,
+        locked_audio_path: 'locked.wav',
+      },
+      { id: 'empty', name: 'Empty Clone', kind: 'clone', ref_audio_path: null },
+    ],
   }),
 }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
@@ -147,4 +164,38 @@ it('offers retry instead of model guidance when engine lookup fails', () => {
   expect(screen.getByText('Engine query failed')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'common.retry' }));
   expect(mock.retry).toHaveBeenCalledOnce();
+});
+
+it.each([
+  ['Captain Crusty', 'design'],
+  ['Legacy Design', 'legacy-design'],
+  ['Locked Clone', 'locked'],
+])('searches and converts the saved profile %s', async (name, id) => {
+  mock.convert.mockResolvedValue({ id: 'x', audio_url: '/audio/x.wav', text: 'Dialogue' });
+  const { upload } = mount();
+  upload();
+  expect(screen.queryByRole('button', { name: 'Empty Clone' })).not.toBeInTheDocument();
+  fireEvent.change(screen.getByRole('textbox', { name: 'convert.pick_voice' }), {
+    target: { value: name.toLowerCase() },
+  });
+  expect(screen.queryByRole('button', { name: 'Alpha' })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name }));
+  fireEvent.click(screen.getByRole('button', { name: 'convert.convert' }));
+  expect(await screen.findByTestId('convert-result')).toBeInTheDocument();
+  expect(mock.convert).toHaveBeenCalledWith(expect.any(File), id, true, expect.any(AbortSignal));
+});
+
+it('exports the converted take through the shared native save action', async () => {
+  mock.convert.mockResolvedValue({ id: 'take-7', audio_url: '/audio/take-7.wav', text: 'Done' });
+  const { upload } = mount();
+  upload();
+  fireEvent.click(screen.getByRole('button', { name: 'Alpha' }));
+  fireEvent.click(screen.getByRole('button', { name: 'convert.convert' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'clone.download' }));
+  await waitFor(() =>
+    expect(mock.saveAudio).toHaveBeenCalledWith({
+      url: '/api/audio/take-7.wav',
+      suggestedName: 'voicestudio-take-7.wav',
+    }),
+  );
 });

@@ -420,8 +420,13 @@ def _resolve_profile_conditioning(row, *, ref_text=None, instruct=None,
             row["instruct"] and not row["is_locked"] and not row["ref_audio_path"]
         ) else "clone"
     out["kind"] = profile_kind
+    # A locked design voice is pinned to its take, and the lock keeps the
+    # design's own seed (#3265): only a new instruct moves it off the take.
+    # Judging the seed too would treat a request repeating the take's seed
+    # as an edit and silently skip the locked take.
+    locked_take = bool(row["is_locked"] and row["locked_audio_path"])
     if profile_kind == "design" and _design_request_diverges(
-        row, instruct=instruct, seed=seed,
+        row, instruct=instruct, seed=None if locked_take else seed,
     ):
         # Design from the request's attributes and seed; only the gaps it
         # left (an omitted instruct or seed) come from the profile.
@@ -511,9 +516,34 @@ def _note_generate_progress() -> None:
         pass
 
 
-def _render_with_pauses(gen_span, segments, sample_rate):
+def _trim_output_edges(audio_out, sample_rate):
+    """Strip the engine's own lead-in/tail silence from a finished take.
+
+    Engines pad every render with near-silence at both ends, so a plain
+    Generate used to start and end with an audible blank. Same helper and
+    floor as the dub path (50 ms of context kept; internal pauses and dead
+    renders untouched). Non-tensor output passes through unchanged.
+    """
+    import torch
+    from services.audio_dsp import trim_speech_padding
+
+    if not torch.is_tensor(audio_out):
+        return audio_out
+    return trim_speech_padding(audio_out, sample_rate)
+
+
+def _wants_edge_trim(effect_preset, duration=None):
+    """Edge trim applies unless the user asked for raw model output or an
+    explicit target duration (trimming would shorten what they asked for)."""
+    return (effect_preset or "broadcast") != "raw" and not duration
+
+
+def _render_with_pauses(gen_span, segments, sample_rate, *, trim_spans=False):
     """Synthesize ``[(text, pause_ms), ...]`` spans and stitch silence between
     them (issue #276).
+
+    ``trim_spans`` strips each span's engine padding first, so a requested
+    pause is the pause the user hears, not pause + the engine's own silence.
 
     ``gen_span(text) -> torch.Tensor`` synthesizes one text span (raw model
     output). A silence buffer of ``pause_ms`` is inserted after a span when
@@ -526,7 +556,10 @@ def _render_with_pauses(gen_span, segments, sample_rate):
     items = []  # ('a', tensor) for audio, ('s', n_samples) for silence
     for span_text, pause_ms in segments:
         if span_text and span_text.strip():
-            items.append(("a", gen_span(span_text)))
+            audio = gen_span(span_text)
+            if trim_spans:
+                audio = _trim_output_edges(audio, sample_rate)
+            items.append(("a", audio))
             _note_generate_progress()
         if pause_ms > 0:
             n = int(round(sample_rate * pause_ms / 1000.0))
@@ -572,9 +605,13 @@ def _sanitize_audio(audio_out):
 
 
 @_render_timed('effects')
-def _apply_effect_chain(audio_out, sample_rate, effect_preset, *, skip_mastering=False):
-    """Shared post-DSP for /generate: preset validation → mastering →
-    effect chain → loudness normalization.
+def _apply_effect_chain(audio_out, sample_rate, effect_preset, *, skip_mastering=False,
+                        trim_edges=False):
+    """Shared post-DSP for /generate: preset validation → edge trim →
+    mastering → effect chain → loudness normalization.
+
+    ``trim_edges`` is for a finished whole take only: streamed preview chunks
+    leave it off so they keep the same timing as the assembled take.
 
     ``skip_mastering`` honors a backend's ``applies_own_mastering`` flag
     (issue #312): studio engines (e.g. VoxCPM2's native 48 kHz output)
@@ -605,6 +642,9 @@ def _apply_effect_chain(audio_out, sample_rate, effect_preset, *, skip_mastering
     if preset == "raw":
         # Raw: skip all DSP — return raw model output
         return audio_out
+
+    if trim_edges:
+        audio_out = _trim_output_edges(audio_out, sample_rate)
 
     if not skip_mastering:
         audio_out = apply_mastering(audio_out, sample_rate=sample_rate)
@@ -1173,7 +1213,8 @@ def _run_inference(
                 # Per-span duration is left to the model; an explicit overall
                 # `duration` can't be meaningfully split across spans.
                 return _gen(span_text, None)[0]
-            audio_out = _render_with_pauses(_gen_span, segments, sr)
+            audio_out = _render_with_pauses(_gen_span, segments, sr,
+                                            trim_spans=_wants_edge_trim(effect_preset))
         else:
             # Wave 1.2: long text is split at sentence boundaries and the
             # per-chunk audio crossfaded — removes the length ceiling. Short
@@ -1203,7 +1244,12 @@ def _run_inference(
 
         # Apply DSP effect preset. The VoiceStudio model never masters its own
         # output, so mastering always runs here (unchanged behavior).
-        return _apply_effect_chain(audio_out, sr, effect_preset)
+        # Pause renders were trimmed per span above; trimming the whole take
+        # would also eat a deliberate leading/trailing [pause].
+        return _apply_effect_chain(
+            audio_out, sr, effect_preset,
+            trim_edges=not has_pause and _wants_edge_trim(effect_preset, duration),
+        )
 
     except ValueError as e:
         # Don't wrap validation errors in OOM message
@@ -1212,13 +1258,22 @@ def _run_inference(
         _oom_friendly_reraise(e)
 
 
+def _backend_supports_seed(backend) -> bool:
+    """Whether this adapter accepts per-request seed controls."""
+    return bool(
+        getattr(backend, "supports_native_omnivoice_controls", False)
+        or getattr(backend, "supports_generation_seed", False)
+    )
+
+
 def _run_backend_inference(
     backend, text, language, ref_audio_path, ref_text, instruct, duration,
     num_step, guidance_scale, speed, denoise, postprocess_output,
     used_seed, effect_preset="broadcast",
     max_chunk_chars=None, crossfade_ms=None, *, t_shift=None,
     layer_penalty_factor=None, position_temperature=None,
-    class_temperature=None, dropped_sink=None,
+    class_temperature=None, dropped_sink=None, preset_voice=None,
+    emotion_kwargs=None,
 ):
     """Engine-aware twin of :func:`_run_inference` (issue #312).
 
@@ -1241,10 +1296,14 @@ def _run_backend_inference(
             instruct=instruct, num_step=num_step, guidance_scale=guidance_scale,
             speed=speed, denoise=denoise, postprocess_output=postprocess_output,
         )
+        if preset_voice:
+            gen_kwargs["voice"] = preset_voice
+        if emotion_kwargs and getattr(backend, "supports_emotion", False):
+            gen_kwargs.update(emotion_kwargs)
         native_proxy = bool(
             getattr(backend, "supports_native_omnivoice_controls", False)
         )
-        forwards_seed = native_proxy or getattr(backend, "supports_generation_seed", False)
+        forwards_seed = _backend_supports_seed(backend)
         if native_proxy:
             gen_kwargs.update({
                 key: value for key, value in {
@@ -1274,7 +1333,8 @@ def _run_backend_inference(
                     span_kwargs["seed"] = used_seed
                 first_span = False
                 return trace_call("synthesis", backend.generate, span_text, duration=None, **span_kwargs)
-            audio_out = _render_with_pauses(_gen_span, segments, sr)
+            audio_out = _render_with_pauses(_gen_span, segments, sr,
+                                            trim_spans=_wants_edge_trim(effect_preset))
         else:
             # Wave 1.2: sentence-boundary chunking for long text (see
             # _run_inference for the rationale; behavior is identical here).
@@ -1308,6 +1368,7 @@ def _run_backend_inference(
         return _apply_effect_chain(
             audio_out, sr, effect_preset,
             skip_mastering=getattr(backend, "applies_own_mastering", False),
+            trim_edges=not has_pause and _wants_edge_trim(effect_preset, duration),
         )
 
     except ValueError as e:
@@ -1672,6 +1733,44 @@ def generate_budget(engine: Optional[str] = None):
     return generate_budget_s(engine)
 
 
+def _parse_emotion_vector(raw: Optional[str]) -> Optional[list[float]]:
+    """Validate IndexTTS2's eight-dimensional emotion vector at the API boundary.
+
+    The engine expects [happy, angry, sad, afraid, disgusted, melancholic,
+    surprised, calm], each 0..1. Validate before loading any models so a
+    malformed request does not occupy GPU memory.
+    """
+    if raw is None or not raw.strip():
+        return None
+    import json
+    import math
+
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422, detail="Emotion vector must be a JSON array of eight numbers."
+        ) from exc
+    if not isinstance(value, list) or len(value) != 8:
+        raise HTTPException(
+            status_code=422, detail="Emotion vector must contain exactly eight values."
+        )
+    if any(
+        isinstance(item, bool)
+        or not isinstance(item, (int, float))
+        # Compare integer bounds *before* converting to a float: a valid
+        # 400-digit JSON integer exceeds float's range and math.isfinite()
+        # would otherwise raise OverflowError (500 instead of HTTP 422).
+        or not 0 <= item <= 1
+        or not math.isfinite(item)
+        for item in value
+    ):
+        raise HTTPException(
+            status_code=422, detail="Each emotion vector value must be a number from 0 to 1."
+        )
+    return [float(item) for item in value]
+
+
 @router.post("/generate")
 async def generate_speech(
     text: str = Form(...),
@@ -1692,11 +1791,19 @@ async def generate_speech(
     layer_penalty_factor: Optional[float] = Form(None),
     position_temperature: Optional[float] = Form(None),
     class_temperature: Optional[float] = Form(None),
+    # IndexTTS2 cloning: emotion timbre is independent of the speaker reference.
+    # Optional; existing engines and requests retain their previous behavior.
+    emo_text: Optional[str] = Form(None, max_length=500),
+    emo_alpha: Optional[float] = Form(None, ge=0.0, le=1.0),
+    emo_vector: Optional[str] = Form(None),
     profile_id: Optional[str] = Form(None),
     seed: Optional[int] = Form(None),
     effect_preset: str = Form("broadcast"),
     wav_bits: Literal["16", "24", "32"] = Form("16"),
     engine: Optional[str] = Form(None),
+    # #2938: one of the engine's built-in voices (``preset_voices`` in the engine
+    # list). Only for engines that ship presets and no cloning reference.
+    preset_voice: Optional[str] = Form(None),
     # Wave 1.2 — unlimited-length generation: long text is split at sentence
     # boundaries and crossfaded. 0 disables chunking (whole text to engine).
     max_chunk_chars: int = Form(800, ge=0),
@@ -1715,6 +1822,12 @@ async def generate_speech(
     # (text-level chunking, no per-engine token streaming).
     stream: bool = Form(False),
 ):
+    """Generate a voice take through the selected TTS engine.
+
+    Validate engine-specific emotion conditioning before loading models,
+    resolve saved voice references, and send the same controls through
+    classic WAV and streaming generation.
+    """
     # #502: NFC-normalize the input text so decomposed (NFD) diacritics — common
     # in pasted Vietnamese and other Latin-with-marks text — are composed to the
     # single codepoints the tokenizer/model expect, instead of base-letter +
@@ -1752,6 +1865,38 @@ async def generate_speech(
                 "See GET /engines/tts for the list of valid engine ids."
             ),
         )
+    # Validate expressive controls before model loads or GPU routing. A
+    # request must not silently lose emotion when switching to an engine
+    # without this capability, or send conflicting emotion sources.
+    import math
+
+    emotion_vector = _parse_emotion_vector(emo_vector)
+    emotion_text = (emo_text or "").strip() or None
+    if emo_alpha is not None and not math.isfinite(emo_alpha):
+        raise HTTPException(status_code=422, detail="Emotion strength must be finite.")
+    if emotion_text and emotion_vector is not None:
+        raise HTTPException(
+            status_code=422, detail="Choose an emotion description OR an emotion vector."
+        )
+    if emo_alpha is not None and not emotion_text:
+        raise HTTPException(
+            status_code=422, detail="Emotion strength requires an emotion description."
+        )
+    if (emotion_text or emotion_vector is not None) and not getattr(
+        backend_cls, "supports_emotion", False
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{engine_id} does not support emotion controls. Choose IndexTTS2.",
+        )
+    emotion_kwargs = {}
+    if emotion_vector is not None:
+        emotion_kwargs["emo_vector"] = emotion_vector
+    elif emotion_text:
+        emotion_kwargs["emo_text"] = emotion_text
+        if emo_alpha is not None:
+            emotion_kwargs["emo_alpha"] = emo_alpha
+
     # Before any routing, eviction or load, and for remote renders too: the
     # licence is accepted by the user asking for the audio. Raises the 403.
     from services.tts_backend import ensure_engine_licence
@@ -1825,6 +1970,18 @@ async def generate_speech(
         # health-check route so weights load once, not per request.
         from api.routers.engines import _get_engine_instance
         _backend = _get_engine_instance(backend_cls)
+
+    preset_voice = (preset_voice or "").strip() or None
+    if preset_voice:
+        from services.tts_backend import preset_voices_of
+        _presets = preset_voices_of(backend_cls)
+        if not _presets:
+            preset_voice = None  # engine has no presets: ignore, like other engine-specific fields
+        elif preset_voice not in _presets:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown preset voice {preset_voice!r}. Valid: {', '.join(_presets)}",
+            )
 
     # ── Routing gate (#21 — no silent CPU fallback). Computed ONCE per
     # request (host caps are constant; the per-request engine= override
@@ -2013,6 +2170,32 @@ async def generate_speech(
         if ref_text and persist_ref_text_profile_id:
             _persist_profile_ref_text(persist_ref_text_profile_id, ref_text)
 
+    # #2764: choosing the best 15 s window of a long reference runs the
+    # installed recognizer over several windows — minutes on a CPU. Inside the
+    # engine call that time was billed to the generate budget and the job was
+    # abandoned ("exceeded 300s") before synthesis began. Do it here, on its own
+    # floor-scaled budget; the engine then recalls the remembered choice. Best
+    # effort: a timeout leaves the engine to rank inline exactly as before.
+    if ref_audio_path and ref_picks_own_passage and backend_cls is OmniVoiceBackend:
+        from services.tts_backend import prepare_reference_passage
+
+        try:
+            from omnivoice.utils.audio import CLONE_REF_MAX_WINDOWS
+
+            await _run_with_reference_lease(
+                ref_lease,
+                lambda release: run_on_gpu_pool_guarded(
+                    functools.partial(prepare_reference_passage, ref_audio_path),
+                    what="Reference passage selection",
+                    timeout=CLONE_REF_MAX_WINDOWS * _generate_timeout_s(
+                        "", execution_device=_routing["effective_device"]
+                    ),
+                    on_abandon=release,
+                )
+            )
+        except TimeoutError as e:
+            logger.warning("reference passage selection hung (%s); engine will rank inline", e)
+
     # #526: materialize a concrete seed when none was supplied (and no profile
     # pinned one) so the take is reproducible and we can hand it back via the
     # X-Seed header for the "keep this seed" control. An explicit request seed
@@ -2109,6 +2292,7 @@ async def generate_speech(
                         instruct=instruct, num_step=num_step,
                         guidance_scale=guidance_scale, speed=speed,
                         denoise=denoise, postprocess_output=postprocess_output,
+                        **(emotion_kwargs if getattr(_backend, "supports_emotion", False) else {}),
                         **({
                             key: value for key, value in {
                                 "t_shift": t_shift,
@@ -2119,10 +2303,7 @@ async def generate_speech(
                         } if getattr(
                             _backend, "supports_native_omnivoice_controls", False
                         ) else {}),
-                        **({"seed": used_seed + i} if used_seed is not None and (
-                            getattr(_backend, "supports_native_omnivoice_controls", False)
-                            or getattr(_backend, "supports_generation_seed", False)
-                        ) else {}),
+                        **({"seed": used_seed + i} if used_seed is not None and _backend_supports_seed(_backend) else {}),
                     )
                     sr = _backend.sample_rate
                     skip = getattr(_backend, "applies_own_mastering", False)
@@ -2170,16 +2351,19 @@ async def generate_speech(
                                                      sink=_dropped_sink)
                 skip = (getattr(_backend, "applies_own_mastering", False)
                         if _backend is not None else False)
-                return _apply_effect_chain(audio_out, sr, effect_preset, skip_mastering=skip)
+                return _apply_effect_chain(audio_out, sr, effect_preset, skip_mastering=skip,
+                                           trim_edges=_wants_edge_trim(effect_preset))
             except ValueError:
                 raise
             except Exception as e:
                 _oom_friendly_reraise(e)
 
         async def _stream_events():
+            """Yield progress, marked audio chunks, and final generation metadata."""
             import json
 
             def _line(obj) -> bytes:
+                """Encode one streaming synthesis event as a compact NDJSON line."""
                 return (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
 
             try:
@@ -2199,6 +2383,8 @@ async def generate_speech(
                                     position_temperature=position_temperature,
                                     class_temperature=class_temperature,
                                     dropped_sink=_dropped_sink,
+                                    preset_voice=preset_voice,
+                                    emotion_kwargs=emotion_kwargs,
                                 ),
                                 what="TTS generate",
                                 min_vram_gb=_engine_min_vram_gb,
@@ -2377,11 +2563,13 @@ async def generate_speech(
                 # diagnostic bundle and opaque to the user (#1607). The raw
                 # exception is NOT logged: it can carry a reference-clip path or
                 # a provider secret, and only the journal scrubs before storing.
+                from core.public_errors import exception_origin, stream_generation_failure
+
+                _origin = exception_origin(exc)
                 logger.error(
-                    "Streaming generation failed unexpectedly (class=%s)",
-                    type(exc).__name__,
+                    "Streaming generation failed unexpectedly (class=%s%s)",
+                    type(exc).__name__, f"; {_origin}" if _origin else "",
                 )
-                from core.public_errors import stream_generation_failure
                 from core import error_journal
 
                 error_journal.record(
@@ -2427,6 +2615,8 @@ async def generate_speech(
                 position_temperature=position_temperature,
                 class_temperature=class_temperature,
                 dropped_sink=_dropped_text,
+                preset_voice=preset_voice,
+                emotion_kwargs=emotion_kwargs,
             )
         else:
             _local_render = functools.partial(
@@ -2554,6 +2744,14 @@ async def generate_speech(
 
         _topic = classify(str(e))
         _owned = public_hint_for_topic(_topic) if _topic else ""
+        if _topic == "REFERENCE_STT_MISSING" and _owned:
+            # Structured so the client can show its localized copy (#2929/#2678)
+            # instead of the English sentence, and so the topic reaches the
+            # bug report.
+            raise HTTPException(
+                status_code=400,
+                detail={"docs_topic": _topic, "message": _owned, "hint": _owned},
+            ) from e
         raise HTTPException(status_code=400, detail=_owned or str(e)) from e
     except Exception as e:
         tb = traceback.format_exc()

@@ -85,6 +85,11 @@ describe('sanitizeInstruct', () => {
 });
 
 describe('toGenerateForm', () => {
+  it('sends the picked preset voice only when one is set (#2938)', () => {
+    expect(toGenerateForm(BASE_INPUT).has('preset_voice')).toBe(false);
+    expect(toGenerateForm({ ...BASE_INPUT, presetVoice: 'F3' }).get('preset_voice')).toBe('F3');
+  });
+
   it('keeps existing defaults and sends explicit quality choices', () => {
     const defaults = toGenerateForm(BASE_INPUT);
     expect(defaults.get('wav_bits')).toBe('16');
@@ -164,6 +169,35 @@ describe('toGenerateForm', () => {
     const form = toGenerateForm({ ...BASE_INPUT, designRecipe });
     expect(JSON.parse(String(form.get('design_recipe')))).toEqual(designRecipe);
     expect(toGenerateForm(BASE_INPUT).has('design_recipe')).toBe(false);
+  });
+
+  it('omits emotion on a neutral take and sends text emotion with strength', () => {
+    const neutral = toGenerateForm(BASE_INPUT);
+    expect(neutral.has('emo_text')).toBe(false);
+    expect(neutral.has('emo_vector')).toBe(false);
+    expect(neutral.has('emo_alpha')).toBe(false);
+    const expressive = toGenerateForm({
+      ...BASE_INPUT,
+      profileId: 'speaker-1',
+      emoText: '  slightly angry, holding back tears  ',
+      emoAlpha: 0.45,
+    });
+    expect(expressive.get('emo_text')).toBe('slightly angry, holding back tears');
+    expect(expressive.get('emo_alpha')).toBe('0.45');
+    expect(expressive.has('emo_vector')).toBe(false);
+  });
+
+  it('sends eight emotion weights and never mixes them with text prompts', () => {
+    const weights = [0.8, 0, 0.1, 0, 0, 0.2, 0, 0];
+    const form = toGenerateForm({
+      ...BASE_INPUT,
+      emoVector: weights,
+      emoText: 'ignored when a vector is present',
+      emoAlpha: 0.5,
+    });
+    expect(JSON.parse(String(form.get('emo_vector')))).toEqual(weights);
+    expect(form.has('emo_text')).toBe(false);
+    expect(form.has('emo_alpha')).toBe(false);
   });
 
   it('sends a free-form engine its description as written (#2389)', () => {
@@ -347,7 +381,10 @@ describe('generateClone', () => {
       budget.queueWait +
       7_200 +
       budget.sidecarGrace +
-      Math.max(budget.progressExtensionCap, budget.progressExtensionBudgets * (7_200 + budget.sidecarGrace));
+      Math.max(
+        budget.progressExtensionCap,
+        budget.progressExtensionBudgets * (7_200 + budget.sidecarGrace),
+      );
     expect(withCeiling).toBeGreaterThan(backendMaxS * 1000);
     expect(withCeiling).toBeGreaterThan(generateAbortMs(20));
     expect(generateAbortMs(20, { cpuAutoCeiling: Number.NaN })).toBe(generateAbortMs(20));
